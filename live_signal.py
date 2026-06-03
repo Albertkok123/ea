@@ -2,16 +2,19 @@
 """
 GoldTrendEA v6.5 — 实时信号监控 + Telegram 通知
 ================================================
-不需要 TradingView 付费！直接用 yfinance 获取行情
-每5分钟检查一次M5信号，有信号立刻发Telegram
+两种运行模式:
 
-用法:
+[本地模式] 无 PORT 环境变量，无限循环每5分钟检测一次:
     export TG_BOT_TOKEN="7xxx:AAAxxx"
     export TG_CHAT_ID="-1001234567890"
     python3.11 live_signal.py
 
+[Web模式] 有 PORT 环境变量，启动 Flask 服务器:
+    - Render Web Service 免费部署
+    - UptimeRobot 每5分钟 GET /health → 触发信号检测
+    - GET / → 状态页面
+
 注意: yfinance 数据有约15分钟延迟（免费行情）
-      适合演示/学习，实盘建议用付费行情源
 """
 
 import os, time, warnings
@@ -20,8 +23,12 @@ import pandas as pd
 import requests
 import yfinance as yf
 from datetime import datetime, timezone
+from flask import Flask, jsonify
 
 warnings.filterwarnings("ignore")
+
+app      = Flask(__name__)
+last_bar = None   # 全局：记录已发送的最后一根bar，防重复
 
 # ══════════════════════════════════════════
 #  配置
@@ -255,7 +262,72 @@ def sleep_to_next_bar():
 
 
 # ══════════════════════════════════════════
-#  主循环
+#  核心：单次信号检测（两种模式共用）
+# ══════════════════════════════════════════
+
+def check_once() -> dict:
+    """下载数据、检测信号、发送 Telegram。返回状态字典。"""
+    global last_bar
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    try:
+        print(f"\n[{ts}] 📡 下载M5数据...", end=" ", flush=True)
+        m5 = download_m5()
+        print(f"{len(m5)}根", end="  ", flush=True)
+
+        result = detect_signal(m5)
+
+        if result is None:
+            bar_t = m5.index[-2]
+            print(f"无信号  bar={bar_t.strftime('%m-%d %H:%M')}")
+            return {"signal": None, "bar": bar_t.strftime("%m-%d %H:%M")}
+
+        direction, price, tp, sl, atr_v, bar_time = result
+
+        if bar_time == last_bar:
+            print(f"重复信号跳过  {direction} @ {price:.2f}")
+            return {"signal": direction, "price": price, "duplicate": True}
+
+        last_bar = bar_time
+        print(f"\n  🎯 {direction}  price={price:.2f}  tp={tp:.2f}  sl={sl:.2f}")
+        msg = format_signal(direction, price, tp, sl, atr_v, bar_time)
+        ok  = tg_send(msg)
+        print(f"  Telegram: {'✅ 已发送' if ok else '❌ 发送失败'}")
+        return {"signal": direction, "price": price, "tg_ok": ok}
+
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        tg_send(f"⚠️ GoldTrendEA 监控异常: {e}")
+        return {"error": str(e)}
+
+
+# ══════════════════════════════════════════
+#  Web 模式：Flask 端点（Render Web Service）
+# ══════════════════════════════════════════
+
+@app.route("/")
+def index():
+    bot_ok  = "✅" if TG_BOT_TOKEN else "❌ 未设置"
+    chat_ok = "✅" if TG_CHAT_ID   else "❌ 未设置"
+    now     = datetime.now(timezone.utc).strftime("%m-%d %H:%M UTC")
+    return (
+        f"<h2>GoldTrendEA v6.5 Live Signal ✅</h2>"
+        f"<p>Bot Token: {bot_ok}<br>"
+        f"Chat ID: {chat_ok}<br>"
+        f"服务器时间: {now}</p>"
+        f"<p>UptimeRobot 每5分钟 ping: "
+        f"<code>GET /health</code></p>"
+    )
+
+
+@app.route("/health")
+def health():
+    """UptimeRobot 每5分钟 ping 这里 → 触发信号检测"""
+    result = check_once()
+    return jsonify({"ok": True, **result})
+
+
+# ══════════════════════════════════════════
+#  入口：自动判断模式
 # ══════════════════════════════════════════
 
 def main():
@@ -266,7 +338,6 @@ def main():
     print(f"  Chat ID   : {'✅ 已设置' if TG_CHAT_ID   else '❌ 未设置'}")
     print(f"  参数      : TP×{TP_MULTI}  SL×{SL_MULTI}  ATR[{ATR_MIN}-{ATR_MAX}]")
     print(f"  交易时间  : UTC {TRADE_START}:00 ~ {TRADE_END}:00")
-    print(f"  H1触发窗口: {H1_TRIG_BARS}根H1")
     print("=" * 52)
 
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
@@ -275,45 +346,32 @@ def main():
         print("   export TG_CHAT_ID='xxx'")
         return
 
-    # 启动通知
-    tg_send(
-        "🚀 <b>GoldTrendEA v6.5 监控启动</b>\n"
-        f"📌 XAUUSD M5\n"
-        f"🎯 TP×{TP_MULTI}  SL×{SL_MULTI}  ATR[{ATR_MIN}-{ATR_MAX}]\n"
-        f"⏰ {datetime.now(timezone.utc).strftime('%m-%d %H:%M UTC')}"
-    )
+    port = int(os.getenv("PORT", 0))
 
-    last_bar = None  # 已处理的最后一根bar时间
-
-    while True:
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        try:
-            print(f"\n[{ts}] 📡 下载M5数据...", end=" ", flush=True)
-            m5 = download_m5()
-            print(f"{len(m5)}根", end="  ", flush=True)
-
-            result = detect_signal(m5)
-
-            if result is None:
-                bar_t = m5.index[-2]
-                print(f"无信号  bar={bar_t.strftime('%m-%d %H:%M')}")
-            else:
-                direction, price, tp, sl, atr_v, bar_time = result
-
-                if bar_time == last_bar:
-                    print(f"重复信号跳过  {direction} @ {price:.2f}")
-                else:
-                    last_bar = bar_time
-                    print(f"\n  🎯 {direction} 信号!  price={price:.2f}  tp={tp:.2f}  sl={sl:.2f}  atr={atr_v:.2f}")
-                    msg = format_signal(direction, price, tp, sl, atr_v, bar_time)
-                    ok  = tg_send(msg)
-                    print(f"  Telegram: {'✅ 已发送' if ok else '❌ 发送失败'}")
-
-        except Exception as e:
-            print(f"\n[ERROR] {e}")
-            tg_send(f"⚠️ GoldTrendEA 监控异常: {e}")
-
-        sleep_to_next_bar()
+    if port:
+        # ── Web 模式（Render 自动设置 PORT）──
+        print(f"  模式      : 🌐 Web Service (PORT={port})")
+        print(f"  UptimeRobot: GET /health 每5分钟")
+        print("=" * 52)
+        tg_send(
+            "🚀 <b>GoldTrendEA v6.5 Web模式启动</b>\n"
+            f"📌 XAUUSD M5  |  PORT={port}\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%m-%d %H:%M UTC')}"
+        )
+        app.run(host="0.0.0.0", port=port, debug=False)
+    else:
+        # ── 本地轮询模式 ──
+        print("  模式      : 🖥️  本地轮询 (每5分钟)")
+        print("=" * 52)
+        tg_send(
+            "🚀 <b>GoldTrendEA v6.5 监控启动</b>\n"
+            f"📌 XAUUSD M5\n"
+            f"🎯 TP×{TP_MULTI}  SL×{SL_MULTI}  ATR[{ATR_MIN}-{ATR_MAX}]\n"
+            f"⏰ {datetime.now(timezone.utc).strftime('%m-%d %H:%M UTC')}"
+        )
+        while True:
+            check_once()
+            sleep_to_next_bar()
 
 
 if __name__ == "__main__":
