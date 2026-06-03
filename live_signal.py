@@ -17,17 +17,20 @@ GoldTrendEA v6.5 — 实时信号监控 + Telegram 通知
 数据源: TradingView (tvDatafeed) — 实时行情，无需付费
 """
 
-import os, time, warnings, sys
+import os, time, warnings
 import numpy as np
 import pandas as pd
 import requests
 from datetime import datetime, timezone
 from flask import Flask, jsonify
 
-# tvDatafeed 路径兼容处理
-sys.path.insert(0, "/usr/local/lib/python3.11/site-packages")
 try:
-    from tvDatafeed import TvDatafeed, Interval as TvInterval
+    try:
+        from tvDatafeed import TvDatafeed, Interval as TvInterval
+    except ModuleNotFoundError:
+        import sys
+        sys.path.insert(0, "/usr/local/lib/python3.11/site-packages")
+        from tvDatafeed import TvDatafeed, Interval as TvInterval
     _TV_USERNAME = os.getenv("TV_USERNAME", "")
     _TV_PASSWORD = os.getenv("TV_PASSWORD", "")
     _tv = TvDatafeed(_TV_USERNAME, _TV_PASSWORD) if (_TV_USERNAME and _TV_PASSWORD) else TvDatafeed()
@@ -152,20 +155,44 @@ def format_signal(direction, price, tp, sl, atr, bar_time):
 #  数据下载
 # ══════════════════════════════════════════
 
-def download_m5():
-    """下载 M5 数据（优先 TradingView，失败回退 yfinance）"""
-    if _USE_TV:
+def _download_tv() -> pd.DataFrame:
+    """从 TradingView 下载，返回空 DataFrame 表示失败"""
+    try:
         df = _tv.get_hist("XAUUSD", "OANDA", TvInterval.in_5_minute, n_bars=500)
-        df.columns = [c.capitalize() for c in df.columns]   # open→Open 等
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        df.columns = [c.capitalize() for c in df.columns]
         df.index   = pd.to_datetime(df.index, utc=True)
         return df[["Open","High","Low","Close"]].dropna()
-    else:
+    except Exception as e:
+        print(f"[TV ERROR] {e}")
+        return pd.DataFrame()
+
+
+def _download_yf() -> pd.DataFrame:
+    """从 yfinance 下载（备用）"""
+    try:
         import yfinance as yf
         df = yf.download("GC=F", period="5d", interval="5m",
                          progress=False, auto_adjust=True)
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
         df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
         df.index   = pd.to_datetime(df.index, utc=True).tz_convert("UTC")
         return df.dropna()
+    except Exception as e:
+        print(f"[YF ERROR] {e}")
+        return pd.DataFrame()
+
+
+def download_m5() -> pd.DataFrame:
+    """优先 TradingView，失败自动回退 yfinance"""
+    if _USE_TV:
+        df = _download_tv()
+        if len(df) > 0:
+            return df
+        print("  [TV空数据，回退yfinance]", end=" ")
+    return _download_yf()
 
 
 # ══════════════════════════════════════════
@@ -293,6 +320,10 @@ def check_once() -> dict:
         m5 = download_m5()
         print(f"{len(m5)}根", end="  ", flush=True)
 
+        if len(m5) < 10:
+            print("数据不足，跳过（市场可能已关闭）")
+            return {"signal": None, "bar": "no_data"}
+
         result = detect_signal(m5)
 
         if result is None:
@@ -314,9 +345,12 @@ def check_once() -> dict:
         return {"signal": direction, "price": price, "tg_ok": ok}
 
     except Exception as e:
-        print(f"\n[ERROR] {e}")
-        tg_send(f"⚠️ GoldTrendEA 监控异常: {e}")
-        return {"error": str(e)}
+        msg = str(e)
+        print(f"\n[ERROR] {msg}")
+        # 数据为空是正常情况（市场关闭/网络抖动），不发 Telegram
+        if "out of bounds" not in msg and "size 0" not in msg:
+            tg_send(f"⚠️ GoldTrendEA 监控异常: {msg}")
+        return {"error": msg}
 
 
 # ══════════════════════════════════════════
