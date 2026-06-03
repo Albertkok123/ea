@@ -14,16 +14,28 @@ GoldTrendEA v6.5 — 实时信号监控 + Telegram 通知
     - UptimeRobot 每5分钟 GET /health → 触发信号检测
     - GET / → 状态页面
 
-注意: yfinance 数据有约15分钟延迟（免费行情）
+数据源: TradingView (tvDatafeed) — 实时行情，无需付费
 """
 
-import os, time, warnings
+import os, time, warnings, sys
 import numpy as np
 import pandas as pd
 import requests
-import yfinance as yf
 from datetime import datetime, timezone
 from flask import Flask, jsonify
+
+# tvDatafeed 路径兼容处理
+sys.path.insert(0, "/usr/local/lib/python3.11/site-packages")
+try:
+    from tvDatafeed import TvDatafeed, Interval as TvInterval
+    _TV_USERNAME = os.getenv("TV_USERNAME", "")
+    _TV_PASSWORD = os.getenv("TV_PASSWORD", "")
+    _tv = TvDatafeed(_TV_USERNAME, _TV_PASSWORD) if (_TV_USERNAME and _TV_PASSWORD) else TvDatafeed()
+    _USE_TV = True
+except Exception as _e:
+    print(f"[WARN] tvDatafeed 不可用，回退到 yfinance: {_e}")
+    import yfinance as yf
+    _USE_TV = False
 
 warnings.filterwarnings("ignore")
 
@@ -141,12 +153,19 @@ def format_signal(direction, price, tp, sl, atr, bar_time):
 # ══════════════════════════════════════════
 
 def download_m5():
-    """下载 5 天 M5 数据 (含指标预热)"""
-    df = yf.download("GC=F", period="5d", interval="5m",
-                     progress=False, auto_adjust=True)
-    df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
-    df.index   = pd.to_datetime(df.index, utc=True).tz_convert("UTC")
-    return df.dropna()
+    """下载 M5 数据（优先 TradingView，失败回退 yfinance）"""
+    if _USE_TV:
+        df = _tv.get_hist("XAUUSD", "OANDA", TvInterval.in_5_minute, n_bars=500)
+        df.columns = [c.capitalize() for c in df.columns]   # open→Open 等
+        df.index   = pd.to_datetime(df.index, utc=True)
+        return df[["Open","High","Low","Close"]].dropna()
+    else:
+        import yfinance as yf
+        df = yf.download("GC=F", period="5d", interval="5m",
+                         progress=False, auto_adjust=True)
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+        df.index   = pd.to_datetime(df.index, utc=True).tz_convert("UTC")
+        return df.dropna()
 
 
 # ══════════════════════════════════════════
